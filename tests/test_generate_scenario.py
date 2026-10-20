@@ -22,10 +22,12 @@ os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 from main import app  # noqa: E402  (env must be set before this import)
 
 client = TestClient(app)
+client.headers.update({"Authorization": "Bearer valid-test-token"})
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 PATIENT_ID = "22222222-2222-2222-2222-222222222201"
+CAREGIVER_ID = "11111111-1111-1111-1111-111111111101"
 
 VALID_LLM_JSON = {
     "title": "Sundowning Agitation at Dusk",
@@ -67,6 +69,9 @@ VALID_LLM_JSON = {
 def _make_supabase_mock(patient_found: bool = True, persist_ok: bool = True):
     """Build a mock Supabase client with chained query methods."""
     sb = MagicMock()
+    sb.auth.get_user.return_value = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=CAREGIVER_ID)
+    )
 
     # patient row
     patient_row = (
@@ -91,6 +96,28 @@ def _make_supabase_mock(patient_found: bool = True, persist_ok: bool = True):
         q.limit.return_value = q
         q.single.return_value = q
         q.insert.return_value = q
+        if table == "caregiver_pat":
+            filters = {}
+
+            def _filter(column, value):
+                filters[column] = value
+                return q
+
+            q.eq.side_effect = _filter
+            q.is_.return_value = q
+            q.execute.side_effect = lambda: MagicMock(
+                data=[
+                    {
+                        "caregiver_id": CAREGIVER_ID,
+                        "patient_id": PATIENT_ID,
+                        "role": "primary",
+                        "status": "active",
+                        "removed_at": None,
+                        "assigned_responsibilities": [],
+                    }
+                ] if filters.get("patient_id") == PATIENT_ID else []
+            )
+            return q
 
         if table == "patient":
             q.execute.return_value = MagicMock(data=patient_row)
@@ -197,7 +224,7 @@ class TestGenerateScenario:
 
         assert resp.status_code == 200, resp.text
 
-    def test_patient_not_found_returns_404(self):
+    def test_patient_without_active_membership_is_forbidden(self):
         sb_mock = _make_supabase_mock(patient_found=False)
         llm_mock = _make_llm_mock(json.dumps(VALID_LLM_JSON))
 
@@ -210,7 +237,38 @@ class TestGenerateScenario:
                 json={"patient_id": "00000000-0000-0000-0000-000000000000"},
             )
 
-        assert resp.status_code == 404
+        assert resp.status_code == 403
+
+    def test_scenario_generation_requires_authentication(self):
+        authorization = client.headers.pop("Authorization")
+        try:
+            response = client.post(
+                "/ai/assistant/generate-scenario",
+                json={"patient_id": PATIENT_ID},
+            )
+        finally:
+            client.headers["Authorization"] = authorization
+        assert response.status_code == 401
+
+    def test_chat_uses_authorized_database_context_not_client_context(self):
+        sb_mock = _make_supabase_mock()
+        llm_mock = _make_llm_mock("Use a calm, supportive approach.")
+        with (
+            patch("ai.ai_router._get_supabase", return_value=sb_mock),
+            patch("ai.ai_router._get_client", return_value=llm_mock),
+        ):
+            response = client.post(
+                "/ai/chat",
+                json={
+                    "message": "What should I keep in mind?",
+                    "patient_id": PATIENT_ID,
+                    "context": {"patientSummary": {"name": "Untrusted Patient"}},
+                },
+            )
+        assert response.status_code == 200, response.text
+        prompt = llm_mock.models.generate_content.call_args.kwargs["contents"]
+        assert "Lakshmi Krishnan" in prompt
+        assert "Untrusted Patient" not in prompt
 
     def test_invalid_llm_json_returns_502(self):
         """LLM returns garbage — should get 502, not 500."""

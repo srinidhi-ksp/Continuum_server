@@ -1,11 +1,18 @@
 import os
 import json
 import uuid
-from fastapi import APIRouter, HTTPException
+import concurrent.futures
+import logging
+import time
+from fastapi import APIRouter, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
+from security import require_active_patient_link, verify_supabase_token
 
 router = APIRouter(prefix="/ai", tags=["AI Caregiver Assistant"])
+logger = logging.getLogger(__name__)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_GEMINI_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
 # ── Gemini client (lazy init) ────────────────────────────────────────────
 _client = None
@@ -29,10 +36,33 @@ def _get_supabase():
     return get_supabase()
 
 
+# ── Auth helpers ─────────────────────────────────────────────────────────
+def _verify_token(authorization: Optional[str]) -> Optional[str]:
+    """Validate Supabase JWT and return caregiver_id (user.id), or None if no token."""
+    return verify_supabase_token(authorization, _get_supabase)
+
+
+def _require_token(authorization: Optional[str] = Header(default=None)) -> str:
+    """Dependency: require a valid Supabase JWT. Returns caregiver_id."""
+    caregiver_id = _verify_token(authorization)
+    if not caregiver_id:
+        raise HTTPException(
+            status_code=401,
+            detail="A valid Supabase bearer token is required.",
+        )
+    return caregiver_id
+
+
+def _require_patient_access(caregiver_id: str, patient_id: str) -> None:
+    """Verify the caregiver has an active link to this patient. Raises 403 if not."""
+    require_active_patient_link(caregiver_id, patient_id, _get_supabase)
+
+
 # ── Request / Response schemas ───────────────────────────────────────────
 class AIChatRequest(BaseModel):
-    message: str = Field(..., description="The caregiver's message/question")
-    context: dict = Field(default_factory=dict, description="Aggregated patient context")
+    message: str = Field(..., min_length=1, max_length=2000, description="The caregiver's message/question")
+    patient_id: Optional[str] = Field(default=None, description="Authorized patient context to use")
+    context: dict = Field(default_factory=dict, description="Deprecated; never trusted by the server")
     language: str = Field(default="en", description="Target language code (en | hi | ta)")
 
 
@@ -118,24 +148,104 @@ Rules for options:
 """
 
 
+def _call_gemini_with_timeout(client, model, contents, config, timeout_seconds=45):
+    """Run Gemini generate_content in a thread with a timeout to avoid hanging."""
+    future = _GEMINI_EXECUTOR.submit(
+        client.models.generate_content,
+        model=model,
+        contents=contents,
+        config=config,
+    )
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"Gemini API call timed out after {timeout_seconds}s") from exc
+
+
+def _is_transient_gemini_error(error: Exception) -> bool:
+    status = getattr(error, "status_code", None) or getattr(error, "code", None)
+    if status in (408, 425, 429, 500, 502, 503, 504):
+        return True
+    message = str(error).lower()
+    return any(
+        term in message
+        for term in (
+            "timeout", "temporarily unavailable", "connection reset",
+            "resource_exhausted", "429", "503", "500", "502", "504",
+        )
+    )
+
+
+def _generate_with_retry(client, model, contents, config, timeout_seconds=25):
+    for attempt in range(2):
+        try:
+            return _call_gemini_with_timeout(client, model, contents, config, timeout_seconds)
+        except Exception as exc:
+            if attempt == 0 and _is_transient_gemini_error(exc):
+                time.sleep(0.5)
+                continue
+            raise
+
+
 @router.post("/chat", response_model=AIChatResponse)
-def ai_chat(payload: AIChatRequest):
-    """Caregiver AI Assistant — receives context + message, returns guidance."""
+def ai_chat(
+    payload: AIChatRequest,
+    caregiver_id: str = Depends(_require_token),
+):
+    """Return guidance using only patient data verified for the authenticated caregiver."""
+
+    # Input validation
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
     client = _get_client()
-
     if not client:
-        # Graceful offline fallback when no API key is configured
-        patient_name = (
-            payload.context.get("patientSummary", {}).get("name", "Unknown")
-        )
-        offline_msg = (
-            f"I'm running in offline mode (no GEMINI_API_KEY configured). "
-            f"I received your question about '{payload.message}' "
-            f"with context for patient {patient_name}. "
-            f"Add GEMINI_API_KEY to Continuum_server/.env and restart the server."
-        )
-        return AIChatResponse(response=offline_msg)
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured on the server.")
+
+    prompt_parts = []
+    if payload.patient_id:
+        _require_patient_access(caregiver_id, payload.patient_id)
+        supabase = _get_supabase()
+        if not supabase:
+            raise HTTPException(status_code=503, detail="Supabase is not configured.")
+        try:
+            patient_result = (
+                supabase.from_("patient")
+                .select("full_name, condition_type")
+                .eq("patient_id", payload.patient_id)
+                .limit(1)
+                .execute()
+            )
+            if not patient_result.data:
+                raise HTTPException(status_code=404, detail="Patient not found.")
+            patient = patient_result.data[0]
+            prompt_parts.append(
+                f"Patient: {patient.get('full_name', 'Patient')}; "
+                f"care condition: {patient.get('condition_type') or 'not recorded'}."
+            )
+            logs_result = (
+                supabase.from_("daily_care_log")
+                .select("type, quantity, symptoms, notes, created_at")
+                .eq("patient_id", payload.patient_id)
+                .order("created_at", desc=True)
+                .limit(5)
+                .execute()
+            )
+            for log in logs_result.data or []:
+                summary = ", ".join(
+                    f"{label}: {log[field]}"
+                    for field, label in (("type", "type"), ("quantity", "details"), ("symptoms", "symptoms"), ("notes", "note"))
+                    if log.get(field)
+                )
+                if summary:
+                    prompt_parts.append(f"Recent care log ({log.get('created_at', '')}): {summary}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Authorized assistant context could not be loaded")
+            raise HTTPException(status_code=503, detail="Patient context is temporarily unavailable.") from exc
 
     # ── Build system instruction ─────────────────────────────────────────
     lang_name = LANG_NAMES.get(payload.language, "English")
@@ -158,73 +268,72 @@ RESPONSE FORMAT:
 - Keep responses concise, well-structured, and actionable.
 - Use bullet points or numbered lists for clarity when appropriate.
 - Address the caregiver warmly and supportively.
+- Format your response with proper paragraphs, headings where useful, and clear spacing.
+- Do NOT use raw Markdown symbols like ** or ## — use plain text with natural structure.
 """
 
     # ── Build prompt with context ────────────────────────────────────────
-    ctx = payload.context
-    prompt_parts = []
-
-    patient_summary = ctx.get("patientSummary")
-    if patient_summary:
-        prompt_parts.append(
-            f"Patient: {patient_summary.get('name', 'Unknown')}, "
-            f"Age: {patient_summary.get('age', 'N/A')}, "
-            f"Condition: {patient_summary.get('condition', 'N/A')}"
-        )
-
-    if ctx.get("caregiverName"):
-        prompt_parts.append(f"Caregiver asking: {ctx['caregiverName']}")
-
-    coord = ctx.get("coordinationScore") or ctx.get("latestMetric")
-    if coord:
-        prompt_parts.append(
-            f"Care Coordination Score: {coord.get('score', 'N/A')}/100, "
-            f"Risk Level: {coord.get('risk_level', 'N/A')}, "
-            f"Recommendation: {coord.get('recommendation', 'N/A')}"
-        )
-
-    if ctx.get("medsTotal") is not None:
-        prompt_parts.append(
-            f"Medications: {ctx.get('medsTaken', 0)} of {ctx['medsTotal']} taken today"
-        )
-    if ctx.get("careCompletion") is not None:
-        prompt_parts.append(f"Today's care completion: {ctx['careCompletion']}%")
-
-    caregivers = ctx.get("caregivers", [])
-    if caregivers:
-        active = sum(1 for c in caregivers if c.get("active"))
-        prompt_parts.append(f"Care circle: {len(caregivers)} members ({active} active)")
-
-    context_block = "\n".join(prompt_parts) if prompt_parts else "No patient context provided."
+    context_block = "\n".join(prompt_parts) if prompt_parts else "No patient context requested."
 
     prompt = f"""=== CARE CONTEXT ===
 {context_block}
 ====================
 
-Caregiver's question: {payload.message}"""
+Caregiver's question: {message}"""
 
     try:
         from google import genai as _genai
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
+        response = _generate_with_retry(
+            client,
+            model=GEMINI_MODEL,
             contents=prompt,
             config=_genai.types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.3,
             ),
+            timeout_seconds=25,
         )
+        if not getattr(response, "text", None):
+            raise HTTPException(status_code=502, detail="The AI returned an empty response. Please try again.")
         return AIChatResponse(response=response.text)
+    except HTTPException:
+        raise
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="The AI assistant took too long to respond. Please try again.",
+        )
     except Exception as e:
-        print(f"[AI Error] {e}")
+        err_str = str(e)
+        logger.exception("AI assistant request failed")
+        # Surface actionable errors
+        if "API_KEY" in err_str or "credentials" in err_str.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="AI service configuration error. Contact your administrator.",
+            )
+        if "quota" in err_str.lower() or "rate" in err_str.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="AI service rate limit reached. Please wait a moment and try again.",
+            )
+        if "model" in err_str.lower() and any(word in err_str.lower() for word in ("not found", "unsupported", "not available")):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Configured Gemini model '{GEMINI_MODEL}' is unavailable. Set GEMINI_MODEL to an available model.",
+            )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate AI response: {str(e)}",
+            detail="Failed to generate AI response. Please try again.",
         )
 
 
 # ── POST /ai/assistant/generate-scenario ─────────────────────────────────
 @router.post("/assistant/generate-scenario", response_model=GenerateScenarioResponse)
-def generate_scenario(payload: GenerateScenarioRequest):
+def generate_scenario(
+    payload: GenerateScenarioRequest,
+    caregiver_id: str = Depends(_require_token),
+):
     """
     Generate a patient-specific AI scenario card + options and persist them
     as real scenario_card / scenario_option rows so scenario_attempt tracking
@@ -232,6 +341,9 @@ def generate_scenario(payload: GenerateScenarioRequest):
 
     Safety: system prompt enforces SRS 3.6 / 3.15 — no diagnosis, no
     medication instructions, educational/supportive only.
+
+    Authorization: requires a valid Supabase JWT and an active caregiver_pat
+    link to the requested patient_id.
     """
     supabase = _get_supabase()
     if not supabase:
@@ -242,6 +354,9 @@ def generate_scenario(payload: GenerateScenarioRequest):
                 "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env."
             ),
         )
+
+    # ── 0. Authorization: verify caregiver has access to this patient ─────
+    _require_patient_access(caregiver_id, payload.patient_id)
 
     # ── 1. Fetch patient row ─────────────────────────────────────────────
     patient_res = (
@@ -320,20 +435,38 @@ def generate_scenario(payload: GenerateScenarioRequest):
 
     try:
         from google import genai as _genai
-        llm_response = client.models.generate_content(
-            model="gemini-3.6-flash",
+        llm_response = _generate_with_retry(
+            client,
+            model=GEMINI_MODEL,
             contents=user_prompt,
             config=_genai.types.GenerateContentConfig(
                 system_instruction=SCENARIO_SYSTEM_INSTRUCTION,
                 temperature=0.7,
             ),
+            timeout_seconds=25,
         )
         raw_text = llm_response.text.strip()
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Scenario generation timed out. Please try again.",
+        )
     except Exception as e:
-        print(f"[AI generate-scenario Error] {e}")
+        err_str = str(e)
+        logger.exception("AI scenario generation failed")
+        if "quota" in err_str.lower() or "rate" in err_str.lower():
+            raise HTTPException(
+                status_code=429,
+                detail="AI service rate limit reached. Please wait a moment and try again.",
+            )
+        if "model" in err_str.lower() and any(word in err_str.lower() for word in ("not found", "unsupported", "not available")):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Configured Gemini model '{GEMINI_MODEL}' is unavailable. Set GEMINI_MODEL to an available model.",
+            )
         raise HTTPException(
             status_code=500,
-            detail=f"LLM call failed: {str(e)}",
+            detail=f"Scenario generation failed. Please try again.",
         )
 
     # ── 6. Parse JSON (strip markdown fences if present) ─────────────────
@@ -351,6 +484,8 @@ def generate_scenario(payload: GenerateScenarioRequest):
         )
 
     # ── 7. Validate required fields ──────────────────────────────────────
+    if not isinstance(scenario_json, dict):
+        raise HTTPException(status_code=502, detail="The AI returned an unexpected scenario format.")
     required_fields = {"title", "scenario_text", "difficulty", "category", "options"}
     missing = required_fields - set(scenario_json.keys())
     if missing:
@@ -362,7 +497,9 @@ def generate_scenario(payload: GenerateScenarioRequest):
     options_raw = scenario_json["options"]
     if not isinstance(options_raw, list) or not (2 <= len(options_raw) <= 4):
         raise HTTPException(status_code=502, detail="AI must return 2-4 options.")
-    if sum(1 for o in options_raw if o.get("is_correct")) != 1:
+    if any(not isinstance(option, dict) for option in options_raw):
+        raise HTTPException(status_code=502, detail="AI scenario options have an invalid format.")
+    if sum(1 for o in options_raw if o.get("is_correct") is True) != 1:
         raise HTTPException(
             status_code=502, detail="AI must mark exactly one option as correct."
         )
@@ -374,8 +511,8 @@ def generate_scenario(payload: GenerateScenarioRequest):
         "patient_id": payload.patient_id,
         "title": scenario_json["title"][:120],
         "scenario_text": scenario_json["scenario_text"],
-        "difficulty": scenario_json.get("difficulty", "medium"),
-        "category": scenario_json.get("category", "dementia_care"),
+        "difficulty": scenario_json["difficulty"],
+        "category": scenario_json["category"],
         "is_ai_generated": True,
     }
     card_res = supabase.from_("scenario_card").insert(card_row).execute()

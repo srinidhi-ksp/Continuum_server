@@ -19,6 +19,7 @@ import pandas as pd
 from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from security import require_primary_patient_link
 
 from ml.supabase_client import get_supabase
 
@@ -49,7 +50,7 @@ class CaregiverWeekFeatures(BaseModel):
     late_logs: float = Field(..., ge=0, le=20)
     task_share: float = Field(..., ge=0, le=1, description="Fraction of total caregiving this person handles")
     notifications_received: float = Field(..., ge=0, le=50)
-    scenario_attempts: float = Field(..., ge=0, le=50)
+    scenario_attempts: float = Field(default=0, ge=0, le=50)
 
     # Optional: when both are provided, the prediction is also written to
     # coordination_metric in Supabase (via the service-role client) so the
@@ -130,7 +131,8 @@ def _to_row(features: CaregiverWeekFeatures) -> pd.DataFrame:
     # array — avoids sklearn's "X does not have valid feature names"
     # warning on every single prediction, since both models were fit on
     # a DataFrame in train_models.py.
-    return pd.DataFrame([[getattr(features, f) for f in FEATURES]], columns=FEATURES)
+    values = [0 if feature == "scenario_attempts" else getattr(features, feature) for feature in FEATURES]
+    return pd.DataFrame([values], columns=FEATURES)
 
 
 def _coordination_score(probabilities: dict, is_anomaly: bool) -> float:
@@ -170,6 +172,10 @@ def predict(
     if features.caregiver_id and features.caregiver_id != authenticated_caregiver_id:
         raise HTTPException(status_code=403, detail="caregiver_id must match the authenticated user")
 
+    patient_id = features.patient_id
+    if patient_id:
+        require_primary_patient_link(authenticated_caregiver_id, patient_id)
+
     try:
         X = _to_row(features)
 
@@ -189,13 +195,13 @@ def predict(
         metric_id = None
         supabase = get_supabase()
 
-        if supabase and features.patient_id and features.caregiver_id:
+        if supabase and patient_id:
             result = (
                 supabase.table("coordination_metric")
                 .insert(
                     {
-                        "patient_id": features.patient_id,
-                        "caregiver_id": features.caregiver_id,
+                        "patient_id": patient_id,
+                        "caregiver_id": authenticated_caregiver_id,
                         "score": coordination_score,
                         "risk_level": risk_level,
                         "recommendation": recommendation,
